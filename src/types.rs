@@ -1,10 +1,13 @@
 //! Defines types for:
 //! - gateway request/responses
-//! - wrappers for presenting drift program types with less implementation detail
+//! - wrappers for presenting velocity program types with less implementation detail
 //!
 use std::convert::TryInto;
 
-use drift_rs::{
+use nanoid::nanoid;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use velocity_rs::{
     constants::ProgramData,
     math::{
         constants::{BASE_PRECISION, PRICE_PRECISION, QUOTE_PRECISION},
@@ -15,12 +18,11 @@ use drift_rs::{
         self as sdk_types,
         accounts::{PerpMarket, SpotMarket},
         MarketPrecision, MarketType, ModifyOrderParams, OrderParams, OrderTriggerCondition,
-        PositionDirection, PostOnlyParam, SignedMsgOrderParamsMessage,
+        PositionDirection, PostOnlyParam, SdkError, SdkResult, SignedMsgOrderParamsDelegateMessage,
+        SignedMsgOrderParamsMessage,
     },
+    Pubkey,
 };
-use nanoid::nanoid;
-use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::websocket::AccountEvent;
 
@@ -81,6 +83,44 @@ impl Order {
     }
 }
 
+/// serde support for the program's `OrderTriggerCondition`, which derives only
+/// anchor traits. Variant names match the enum so the JSON form is unchanged.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "OrderTriggerCondition")]
+enum OrderTriggerConditionDef {
+    Above,
+    Below,
+    TriggeredAbove,
+    TriggeredBelow,
+}
+
+/// as [`OrderTriggerConditionDef`], for `Option` fields
+mod opt_order_trigger_condition {
+    use super::{OrderTriggerCondition, OrderTriggerConditionDef};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(
+        value: &Option<OrderTriggerCondition>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wrapper<'a>(#[serde(with = "OrderTriggerConditionDef")] &'a OrderTriggerCondition);
+        value.as_ref().map(Wrapper).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OrderTriggerCondition>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wrapper(#[serde(with = "OrderTriggerConditionDef")] OrderTriggerCondition);
+        Ok(Option::<Wrapper>::deserialize(deserializer)?.map(|w| w.0))
+    }
+}
+
 fn order_type_ser<S>(order_type: &sdk_types::OrderType, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -120,10 +160,14 @@ pub struct SpotPosition {
 }
 
 impl SpotPosition {
-    pub fn from_sdk_type(position: &sdk_types::SpotPosition, spot_market: &SpotMarket) -> Self {
-        // TODO: handle error
-        let token_amount = position.get_token_amount(spot_market).expect("ok");
-        Self {
+    pub fn from_sdk_type(
+        position: &sdk_types::SpotPosition,
+        spot_market: &SpotMarket,
+    ) -> SdkResult<Self> {
+        let token_amount = position
+            .get_token_amount(spot_market)
+            .map_err(|err| SdkError::Anchor(Box::new(err.into())))?;
+        Ok(Self {
             amount: Decimal::from_i128_with_scale(token_amount as i128, spot_market.decimals)
                 .normalize(),
             market_index: position.market_index,
@@ -132,7 +176,7 @@ impl SpotPosition {
             } else {
                 "borrow".into()
             },
-        }
+        })
     }
 }
 
@@ -246,7 +290,7 @@ impl ModifyOrder {
 
         let oracle_price_offset = self
             .oracle_price_offset
-            .map(|p| scale_decimal_to_i64(p, PRICE_PRECISION as u32) as i32);
+            .map(|p| scale_decimal_to_i64(p, PRICE_PRECISION as u32));
 
         ModifyOrderParams {
             base_asset_amount: amount,
@@ -279,7 +323,7 @@ pub struct PlaceOrder {
     price: Decimal,
     #[serde(default)]
     trigger_price: Option<Decimal>,
-    #[serde(default)]
+    #[serde(default, with = "opt_order_trigger_condition")]
     trigger_condition: Option<OrderTriggerCondition>,
     /// 0 indicates it is not set (according to program)
     #[serde(default)]
@@ -383,7 +427,7 @@ impl PlaceOrder {
 
         let oracle_price_offset = self
             .oracle_price_offset
-            .map(|x| scale_decimal_to_i64(x, PRICE_PRECISION as u32) as i32);
+            .map(|x| scale_decimal_to_i64(x, PRICE_PRECISION as u32));
 
         OrderParams {
             market_index: self.market.market_index,
@@ -415,35 +459,77 @@ impl PlaceOrder {
             ..Default::default()
         }
     }
+}
 
-    pub fn to_signed_order_hex(
-        self,
-        order_params: OrderParams,
-        slot: u64,
-        sub_account_id: u16,
-    ) -> Vec<u8> {
-        let order = SignedMsgOrderParamsMessage {
-            signed_msg_order_params: order_params,
-            slot,
-            uuid: nanoid!(8).as_bytes().try_into().unwrap(),
-            sub_account_id,
-            take_profit_order_params: None, // TODO: add take profit order params
-            stop_loss_order_params: None,   // TODO: add stop loss order params
-            max_margin_ratio: None,
-            builder_idx: None,
-            builder_fee_tenth_bps: None,
-            isolated_position_deposit: None,
-        };
+/// How a swift order message is signed
+///
+/// The two forms are *not* interchangeable: they use different borsh prefixes and
+/// the delegate form carries the taker's sub-account address in place of its id.
+///
+/// The form must match the signing key. The swift node derives `is_delegate_signer`
+/// from the prefix (`SignedOrderType::is_delegated`), and the program then requires
+/// the ed25519 signer to be `taker.authority` when that flag is false, or
+/// `taker.delegate` when it is true. Signing with a delegate key while emitting the
+/// authority form makes the program check the signature against the authority and
+/// reject the order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SwiftSigner {
+    /// signed by the account authority
+    Authority { sub_account_id: u16 },
+    /// signed by an authorized delegate
+    Delegate { taker_pubkey: Pubkey },
+}
 
-        // TODO: support delegate signed message type here
-        let signed_order_type = SignedOrderType::authority(order);
+/// Build the hexified, borsh-encoded swift order message
+///
+/// Returns the order's `uuid` alongside the payload; it identifies the order to
+/// the swift node and is not recoverable from the message otherwise.
+pub fn to_signed_order_hex(
+    order_params: OrderParams,
+    slot: u64,
+    signer: SwiftSigner,
+) -> (String, Vec<u8>) {
+    // nanoid's default alphabet is ASCII, so 8 chars is always 8 bytes
+    let uuid_str = nanoid!(8);
+    let uuid: [u8; 8] = uuid_str.as_bytes().try_into().expect("8 byte uuid");
 
-        let borsh_encoding = signed_order_type.to_borsh();
-        let borsh_bytes = borsh_encoding.as_slice();
-        let mut hex_bytes = vec![0; borsh_bytes.len() * 2]; // 2 hex bytes per msg byte
-        let _ = faster_hex::hex_encode(borsh_bytes, &mut hex_bytes).expect("hexified");
-        hex_bytes
-    }
+    let signed_order_type = match signer {
+        SwiftSigner::Authority { sub_account_id } => {
+            SignedOrderType::authority(SignedMsgOrderParamsMessage {
+                signed_msg_order_params: order_params,
+                slot,
+                uuid,
+                sub_account_id,
+                take_profit_order_params: None, // TODO: add take profit order params
+                stop_loss_order_params: None,   // TODO: add stop loss order params
+                max_margin_ratio: None,
+                builder_idx: None,
+                builder_fee_tenth_bps: None,
+                isolated_position_deposit: None,
+            })
+        }
+        SwiftSigner::Delegate { taker_pubkey } => {
+            SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
+                signed_msg_order_params: order_params,
+                taker_pubkey,
+                slot,
+                uuid,
+                take_profit_order_params: None, // TODO: add take profit order params
+                stop_loss_order_params: None,   // TODO: add stop loss order params
+                max_margin_ratio: None,
+                builder_idx: None,
+                builder_fee_tenth_bps: None,
+                isolated_position_deposit: None,
+            })
+        }
+    };
+
+    let borsh_encoding = signed_order_type.to_borsh();
+    let borsh_bytes = borsh_encoding.as_slice();
+    let mut hex_bytes = vec![0; borsh_bytes.len() * 2]; // 2 hex bytes per msg byte
+    faster_hex::hex_encode(borsh_bytes, &mut hex_bytes).expect("hexified");
+
+    (uuid_str, hex_bytes)
 }
 
 #[cfg_attr(test, derive(Default))]
@@ -531,9 +617,9 @@ impl From<SpotMarket> for MarketInfo {
     fn from(value: SpotMarket) -> Self {
         Self {
             market_id: value.market_index,
-            symbol: unsafe { core::str::from_utf8_unchecked(&value.name) }
-                .trim_end()
-                .to_string(),
+            // `name` is raw on-chain bytes; `from_utf8_unchecked` here would be UB
+            // for any market whose name is not valid utf8.
+            symbol: String::from_utf8_lossy(&value.name).trim_end().to_string(),
             price_step: Decimal::new(value.price_tick() as i64, PRICE_PRECISION.ilog10())
                 .normalize(),
             amount_step: Decimal::new(value.quantity_tick() as i64, value.decimals).normalize(),
@@ -548,9 +634,9 @@ impl From<PerpMarket> for MarketInfo {
     fn from(value: PerpMarket) -> Self {
         Self {
             market_id: value.market_index,
-            symbol: unsafe { core::str::from_utf8_unchecked(&value.name) }
-                .trim_end()
-                .to_string(),
+            // `name` is raw on-chain bytes; `from_utf8_unchecked` here would be UB
+            // for any market whose name is not valid utf8.
+            symbol: String::from_utf8_lossy(&value.name).trim_end().to_string(),
             price_step: Decimal::new(value.price_tick() as i64, PRICE_PRECISION.ilog10())
                 .normalize(),
             amount_step: Decimal::new(value.quantity_tick() as i64, BASE_PRECISION.ilog10())
@@ -631,6 +717,9 @@ pub struct SignedMsgResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SignedMsgOrderResult {
     pub hash: String,
+    /// the order's swift uuid, it is generated per order and not otherwise
+    /// recoverable by the caller
+    pub uuid: String,
     pub status: String,
     pub error: Option<String>,
 }
@@ -649,16 +738,20 @@ pub struct CancelAndPlaceRequest {
     pub place: PlaceOrdersRequest,
 }
 
-/// Return the number of decimal places for the market
+/// Return the number of decimal places for the market, `None` if the market index
+/// is unknown.
+///
+/// The index is caller-supplied on the order paths, so an unknown one must be
+/// reported rather than panic. Guessing a default would silently misscale the
+/// order size.
 #[inline]
-pub(crate) fn get_market_decimals(program_data: &ProgramData, market: Market) -> u32 {
+pub(crate) fn get_market_decimals(program_data: &ProgramData, market: Market) -> Option<u32> {
     if let MarketType::Perp = market.market_type {
-        BASE_PRECISION.ilog10()
+        Some(BASE_PRECISION.ilog10())
     } else {
-        let spot_market = program_data
+        program_data
             .spot_market_config_by_index(market.market_index)
-            .expect("market exists");
-        spot_market.decimals
+            .map(|spot_market| spot_market.decimals)
     }
 }
 
@@ -732,12 +825,13 @@ pub struct IncomingSignedMessage {
 mod tests {
     use std::str::FromStr;
 
-    use drift_rs::{
+    use velocity_rs::{
         math::constants::BASE_PRECISION,
         types::{MarketType, OrderTriggerCondition, OrderType, PositionDirection},
+        Pubkey,
     };
 
-    use super::{Decimal, PlaceOrder};
+    use super::{to_signed_order_hex, Decimal, PlaceOrder, SwiftSigner};
     use crate::types::{Market, ModifyOrder, Order};
 
     #[test]
@@ -840,7 +934,7 @@ mod tests {
         assert_eq!(order.price, 0);
         assert_eq!(order.oracle_price_offset, Some(-500_000));
 
-        let o = drift_rs::types::Order {
+        let o = velocity_rs::types::Order {
             base_asset_amount: 1 * BASE_PRECISION as u64,
             price: 0,
             market_index: 0,
@@ -862,7 +956,7 @@ mod tests {
             (5_123_456_789, Decimal::from_str("5.123456789").unwrap(), 9),
         ];
         for (input, expected, base_decimals) in cases {
-            let o = drift_rs::types::Order {
+            let o = velocity_rs::types::Order {
                 base_asset_amount: input,
                 price: input,
                 market_type: MarketType::Perp.into(),
@@ -900,5 +994,122 @@ mod tests {
         assert_eq!(order_params.base_asset_amount, Some(12_000_000_000));
         assert_eq!(order_params.price, Some(1_020_000));
         assert_eq!(order_params.oracle_price_offset, Some(-2_000_000));
+    }
+
+    /// helper: hex payload -> raw borsh bytes
+    fn decode(hex: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; hex.len() / 2];
+        faster_hex::hex_decode(hex, &mut out).expect("valid hex");
+        out
+    }
+
+    fn test_order_params() -> velocity_rs::types::OrderParams {
+        PlaceOrder {
+            amount: Decimal::from_str("1.5").unwrap(),
+            price: Decimal::from_str("100").unwrap(),
+            market: Market::perp(0),
+            ..Default::default()
+        }
+        .to_order_params(9)
+    }
+
+    /// regression: the gateway always emitted the authority form, even when signing
+    /// with a delegate key. the swift node reads `is_delegate_signer` off the prefix,
+    /// so the program then required the ed25519 signer to be `taker.authority` while
+    /// the payload had actually been signed by the delegate -- every delegated swift
+    /// order was rejected on-chain.
+    #[test]
+    fn swift_delegate_uses_the_delegate_message_form() {
+        use velocity_rs::swift_order_subscriber::{SWIFT_DELEGATE_MSG_PREFIX, SWIFT_MSG_PREFIX};
+
+        let taker = Pubkey::new_unique();
+        let (_, authority_hex) = to_signed_order_hex(
+            test_order_params(),
+            123,
+            SwiftSigner::Authority { sub_account_id: 7 },
+        );
+        let (_, delegate_hex) = to_signed_order_hex(
+            test_order_params(),
+            123,
+            SwiftSigner::Delegate {
+                taker_pubkey: taker,
+            },
+        );
+
+        let authority_msg = decode(&authority_hex);
+        let delegate_msg = decode(&delegate_hex);
+
+        assert_eq!(
+            authority_msg[..8],
+            SWIFT_MSG_PREFIX,
+            "authority order must carry the authority prefix"
+        );
+        assert_eq!(
+            delegate_msg[..8],
+            SWIFT_DELEGATE_MSG_PREFIX,
+            "delegate order must carry the delegate prefix"
+        );
+
+        // the delegate form identifies the taker by sub-account address; the
+        // authority form has no pubkey at all, only a u16 id
+        let taker_bytes = taker.to_bytes();
+        assert!(
+            delegate_msg
+                .windows(taker_bytes.len())
+                .any(|w| w == taker_bytes),
+            "delegate message must embed the taker pubkey"
+        );
+        assert!(
+            !authority_msg
+                .windows(taker_bytes.len())
+                .any(|w| w == taker_bytes),
+            "authority message must not embed a taker pubkey"
+        );
+    }
+
+    /// the uuid is generated internally and is not recoverable by the caller
+    /// unless it is returned
+    #[test]
+    fn swift_returns_the_uuid_embedded_in_the_message() {
+        let (uuid, hex) = to_signed_order_hex(
+            test_order_params(),
+            123,
+            SwiftSigner::Authority { sub_account_id: 0 },
+        );
+        let msg = decode(&hex);
+
+        assert_eq!(uuid.len(), 8, "uuid is 8 bytes on the wire");
+        assert!(
+            msg.windows(8).any(|w| w == uuid.as_bytes()),
+            "returned uuid must be the one signed into the message"
+        );
+    }
+
+    /// the program's `OrderTriggerCondition` has no serde derive, gateway
+    /// provides its own. assert the JSON form matches the variant names
+    #[test]
+    fn trigger_condition_json_round_trips() {
+        for (json, expected) in [
+            ("Above", OrderTriggerCondition::Above),
+            ("Below", OrderTriggerCondition::Below),
+            ("TriggeredAbove", OrderTriggerCondition::TriggeredAbove),
+            ("TriggeredBelow", OrderTriggerCondition::TriggeredBelow),
+        ] {
+            let body = format!(
+                r#"{{"marketIndex":0,"marketType":"perp","amount":1.0,"triggerCondition":"{json}"}}"#
+            );
+            let order: PlaceOrder = serde_json::from_str(&body).expect("deserializes");
+            assert_eq!(order.trigger_condition, Some(expected));
+
+            let out = serde_json::to_value(&order).expect("serializes");
+            assert_eq!(out["triggerCondition"], serde_json::json!(json));
+        }
+    }
+
+    #[test]
+    fn trigger_condition_defaults_to_none() {
+        let body = r#"{"marketIndex":0,"marketType":"perp","amount":1.0}"#;
+        let order: PlaceOrder = serde_json::from_str(body).expect("deserializes");
+        assert!(order.trigger_condition.is_none());
     }
 }

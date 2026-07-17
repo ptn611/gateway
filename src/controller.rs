@@ -3,13 +3,26 @@ use std::{
     collections::HashSet,
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
 use base64::Engine as _;
-use drift_rs::{
+use futures_util::{
+    stream::{FuturesOrdered, FuturesUnordered},
+    FutureExt, StreamExt,
+};
+use log::{debug, info, trace, warn};
+use rust_decimal::Decimal;
+use sha256::digest;
+use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_rpc_client_api::{
+    client_error::ErrorKind as ClientErrorKind,
+    config::{RpcAccountInfoConfig, RpcTransactionConfig},
+};
+use solana_transaction_status::{option_serializer::OptionSerializer, UiTransactionEncoding};
+use thiserror::Error;
+use velocity_rs::{
     constants::{ProgramData, DEFAULT_PUBKEY},
-    drift_idl::{self, types::MarginRequirementType},
     event_subscriber::{try_parse_log, CommitmentConfig, RpcClient},
     jupiter::{JupiterSwapApi, SwapMode},
     math::{
@@ -24,40 +37,26 @@ use drift_rs::{
     slot_subscriber::SlotSubscriber,
     titan::{Provider, SwapMode as TitanSwapMode, TitanSwapApi},
     types::{
-        self, accounts::SpotMarket, MarketId, MarketType, ModifyOrderParams, OrderParams,
-        OrderStatus, ProgramError, RpcSendTransactionConfig, SdkError, SdkResult, VersionedMessage,
+        self, accounts::SpotMarket, solana_sdk::signature::Signature, MarginRequirementType,
+        MarketId, MarketType, ModifyOrderParams, OrderParams, OrderStatus, ProgramError,
+        RpcSendTransactionConfig, SdkError, SdkResult, VersionedMessage,
     },
     utils::get_http_url,
-    DriftClient, Pubkey, TransactionBuilder, Wallet,
+    Pubkey, TransactionBuilder, VelocityClient, Wallet,
 };
-use futures_util::{
-    stream::{FuturesOrdered, FuturesUnordered},
-    FutureExt, StreamExt,
-};
-use log::{debug, info, trace, warn};
-use rust_decimal::Decimal;
-use sha256::digest;
-use solana_account_decoder_client_types::UiAccountEncoding;
-use solana_rpc_client_api::{
-    client_error::ErrorKind as ClientErrorKind,
-    config::{RpcAccountInfoConfig, RpcTransactionConfig},
-};
-use solana_sdk::signature::Signature;
-use solana_transaction_status::{option_serializer::OptionSerializer, UiTransactionEncoding};
-use thiserror::Error;
 
 use crate::{
     types::{
-        get_market_decimals, scale_decimal_to_u64, AllMarketsResponse, AuthorityResponse,
-        CancelAndPlaceRequest, CancelOrdersRequest, GetOrdersRequest, GetOrdersResponse,
-        GetPositionsRequest, GetPositionsResponse, IncomingSignedMessage, Market,
-        MarketInfoResponse, ModifyOrdersRequest, Order, PerpPosition, PerpPositionExtended,
+        get_market_decimals, scale_decimal_to_u64, to_signed_order_hex, AllMarketsResponse,
+        AuthorityResponse, CancelAndPlaceRequest, CancelOrdersRequest, GetOrdersRequest,
+        GetOrdersResponse, GetPositionsRequest, GetPositionsResponse, IncomingSignedMessage,
+        Market, MarketInfoResponse, ModifyOrdersRequest, Order, PerpPosition, PerpPositionExtended,
         PlaceOrderResponse, PlaceOrderType, PlaceOrdersRequest, SignedMsgOrderResult,
-        SignedMsgResponse, SolBalanceResponse, SpotPosition, SwapRequest, TitanSwapRequest,
-        TxEventsResponse, TxResponse, UserCollateralResponse, UserLeverageResponse,
-        UserMarginResponse, PRICE_DECIMALS,
+        SignedMsgResponse, SolBalanceResponse, SpotPosition, SwapRequest, SwiftSigner,
+        TitanSwapRequest, TxEventsResponse, TxResponse, UserCollateralResponse,
+        UserLeverageResponse, UserMarginResponse, PRICE_DECIMALS,
     },
-    websocket::map_drift_event_for_account,
+    websocket::map_velocity_event_for_account,
     Context, LOG_TARGET,
 };
 
@@ -78,12 +77,15 @@ pub enum ControllerError {
     TxFailed { reason: String, code: u32 },
     #[error("tx not found: {tx_sig}")]
     TxNotFound { tx_sig: String },
+    /// gateway is not ready to serve the request yet, the caller should retry
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub wallet: Arc<Wallet>,
-    pub client: Arc<DriftClient>,
+    pub client: Arc<VelocityClient>,
     /// Solana tx commitment level for preflight confirmation
     tx_commitment: CommitmentConfig,
     /// sub_account_ids to subscribe to
@@ -94,16 +96,21 @@ pub struct AppState {
     slot_subscriber: Arc<SlotSubscriber>,
     /// list of additional RPC endpoints for tx broadcast
     extra_rpcs: Vec<Arc<RpcClient>>,
-    /// swift node url
-    swift_node: String,
+    /// `{swift_node}/orders`, precomputed
+    swift_orders_url: Arc<str>,
+    /// shared client for swift order submission
+    ///
+    /// `reqwest::Client` owns the connection pool; constructing one per request
+    /// forces a fresh TCP+TLS handshake onto the order path.
+    swift_client: reqwest::Client,
 }
 
 impl AppState {
-    /// Configured drift authority address
+    /// Configured velocity authority address
     pub fn authority(&self) -> &Pubkey {
         self.wallet.authority()
     }
-    /// Configured drift signing address
+    /// Configured velocity signing address
     pub fn signer(&self) -> Pubkey {
         self.wallet.signer()
     }
@@ -115,15 +122,17 @@ impl AppState {
             .sub_account(sub_account_id.unwrap_or(self.default_sub_account_id()))
     }
 
-    /// Initialize Gateway Drift client
+    /// Initialize Gateway Velocity client
     ///
     /// * `endpoint` - Solana RPC node HTTP/S endpoint
     /// * `devnet` - whether to run against devnet or not
     /// * `wallet` - wallet to use for tx signing
     /// * `commitment` - Slot finalisation/commitement levels
-    /// * `sub_account_ids` - the sub_accounts to subscribe too. In your query specify a specific subaccount, otherwise subaccount 0 will be used as default
+    /// * `sub_account_ids` - the sub_accounts to subscribe to. the first is the default,
+    ///   used when a request does not specify `subAccountId`
     /// * `skip_tx_preflight` - submit txs without checking preflight results
     /// * `extra_rpcs` - list of additional RPC endpoints for tx submission
+    /// * `swift_node` - base url of the swift node for signed-message orders
     pub async fn new(
         endpoint: &str,
         devnet: bool,
@@ -143,7 +152,7 @@ impl AppState {
         };
 
         let rpc_client = RpcClient::new_with_commitment(endpoint.into(), state_commitment);
-        let client = DriftClient::new(context, rpc_client, wallet.clone())
+        let client = VelocityClient::new(context, rpc_client, wallet.clone())
             .await
             .expect("ok");
 
@@ -197,7 +206,11 @@ impl AppState {
                 .into_iter()
                 .map(|u| Arc::new(RpcClient::new(get_http_url(u).expect("valid RPC url"))))
                 .collect(),
-            swift_node,
+            swift_orders_url: format!("{}/orders", swift_node.trim_end_matches('/')).into(),
+            swift_client: reqwest::Client::builder()
+                .pool_idle_timeout(Duration::from_secs(60))
+                .build()
+                .expect("swift client built"),
         }
     }
 
@@ -250,11 +263,13 @@ impl AppState {
             info!(target: LOG_TARGET, "Pubsub successfully subscribed to user account updates!");
 
             // Process incoming account updates
-            while let Some(_) = account_subscription.next().await {
-                let current_market_ids_count = current_user_markets_to_subscribe.len();
+            while account_subscription.next().await.is_some() {
                 match self_clone.get_marketids_to_subscribe(sub_account).await {
                     Ok(new_market_ids) => {
-                        if new_market_ids.len() != current_market_ids_count {
+                        // NB: compare membership, not count. Closing one market and
+                        // opening another leaves the count unchanged, which used to
+                        // skip the refresh and leave the new market unsubscribed.
+                        if new_market_ids != current_user_markets_to_subscribe {
                             if let Err(err) = self_clone
                                 .subscribe_market_data(&configured_markets_vec)
                                 .await
@@ -283,12 +298,12 @@ impl AppState {
     async fn get_marketids_to_subscribe(
         &self,
         sub_account: Pubkey,
-    ) -> Result<Vec<MarketId>, SdkError> {
+    ) -> Result<HashSet<MarketId>, SdkError> {
         let (all_spot, all_perp) = self.client.all_positions(&sub_account).await?;
 
         let open_orders = self.client.all_orders(&sub_account).await?;
 
-        let user_markets: Vec<MarketId> = all_spot
+        let user_markets: HashSet<MarketId> = all_spot
             .iter()
             .map(|s| MarketId::spot(s.market_index))
             .chain(all_perp.iter().map(|p| MarketId::perp(p.market_index)))
@@ -308,8 +323,8 @@ impl AppState {
     ///
     /// * configured_markets - list of static markets provided by user
     ///
-    /// additional subscriptions will be included based on user's current positions (on default sub-account)
-
+    /// additional subscriptions are included based on current positions and open orders,
+    /// across every configured sub-account
     pub(crate) async fn subscribe_market_data(
         &self,
         configured_markets: &[MarketId],
@@ -328,13 +343,14 @@ impl AppState {
     ) -> Result<(), SdkError> {
         let sub_account = self.sub_account(sub_account_id);
         let mut user_markets = self.get_marketids_to_subscribe(sub_account).await?;
-        user_markets.extend_from_slice(configured_markets);
+        user_markets.extend(configured_markets.iter().copied());
 
         let init_rpc_throttle: u64 = std::env::var("INIT_RPC_THROTTLE")
-            .map(|s| s.parse().unwrap())
+            .ok()
+            .and_then(|s| s.parse().ok())
             .unwrap_or(1);
 
-        let markets = Vec::from_iter(HashSet::<MarketId>::from_iter(user_markets).into_iter());
+        let markets = Vec::from_iter(user_markets);
         info!(target: LOG_TARGET, "start market subscriptions: {markets:?}");
         tokio::time::sleep(Duration::from_secs(init_rpc_throttle)).await;
         self.client.subscribe_oracles(&markets).await?;
@@ -406,7 +422,7 @@ impl AppState {
             .await?;
 
         // calculating spot token balance requires knowing the 'spot market account' data
-        let filtered_spot_positions: Vec<&drift_idl::types::SpotPosition> = all_spot
+        let filtered_spot_positions: Vec<&types::SpotPosition> = all_spot
             .iter()
             .filter(|p| {
                 if let Some(GetPositionsRequest { ref market }) = req {
@@ -426,13 +442,12 @@ impl AppState {
             .collect::<Vec<SdkResult<SpotMarket>>>()
             .await;
 
+        // an RPC hiccup on any one market must fail the request, not the process
         let filtered_spot_positions = filtered_spot_positions
             .iter()
-            .zip(spot_markets.iter())
-            .map(|(position, market)| {
-                SpotPosition::from_sdk_type(position, market.as_ref().expect("spot market"))
-            })
-            .collect();
+            .zip(spot_markets)
+            .map(|(position, market)| SpotPosition::from_sdk_type(position, &market?))
+            .collect::<SdkResult<Vec<SpotPosition>>>()?;
 
         Ok(GetPositionsResponse {
             spot: filtered_spot_positions,
@@ -536,31 +551,29 @@ impl AppState {
         let sub_account = self.resolve_sub_account(ctx.sub_account_id);
         let user = self.client.get_user_account(&sub_account).await?;
 
-        let orders: Vec<types::Order> = user
+        let orders = user
             .orders
             .into_iter()
-            .filter(|o| o.status == OrderStatus::Open)
-            .collect();
-
-        Ok(GetOrdersResponse {
-            orders: orders
-                .into_iter()
-                .filter(|o| {
-                    if let Some(GetOrdersRequest { ref market }) = req {
-                        o.market_index == market.market_index && o.market_type == market.market_type
-                    } else {
-                        true
+            .filter(|o| {
+                o.status == OrderStatus::Open
+                    && match req {
+                        Some(GetOrdersRequest { ref market }) => {
+                            o.market_index == market.market_index
+                                && o.market_type == market.market_type
+                        }
+                        None => true,
                     }
-                })
-                .map(|o| {
-                    let base_decimals = get_market_decimals(
-                        self.client.program_data(),
-                        Market::new(o.market_index, o.market_type),
-                    );
-                    Order::from_sdk_order(o, base_decimals)
-                })
-                .collect(),
-        })
+            })
+            .map(|o| {
+                let base_decimals = market_decimals(
+                    self.client.program_data(),
+                    Market::new(o.market_index, o.market_type),
+                )?;
+                Ok(Order::from_sdk_order(o, base_decimals))
+            })
+            .collect::<GatewayResult<Vec<Order>>>()?;
+
+        Ok(GetOrdersResponse { orders })
     }
 
     pub fn get_markets(&self) -> AllMarketsResponse {
@@ -579,7 +592,7 @@ impl AppState {
     ) -> GatewayResult<MarketInfoResponse> {
         let perp = self.client.get_perp_market_account(market_index).await?;
         let open_interest = (perp.get_open_interest() / BASE_PRECISION) as u64;
-        let max_open_interest = (perp.amm.max_open_interest.as_u128() / BASE_PRECISION) as u64;
+        let max_open_interest = (perp.max_open_interest / BASE_PRECISION) as u64;
 
         Ok(MarketInfoResponse {
             open_interest,
@@ -597,10 +610,10 @@ impl AppState {
             .orders
             .into_iter()
             .map(|o| {
-                let base_decimals = get_market_decimals(self.client.program_data(), o.market);
-                o.to_order_params(base_decimals)
+                let base_decimals = market_decimals(self.client.program_data(), o.market)?;
+                Ok(o.to_order_params(base_decimals))
             })
-            .collect();
+            .collect::<GatewayResult<Vec<OrderParams>>>()?;
 
         let sub_account = self.resolve_sub_account(ctx.sub_account_id);
         let account_data = self.client.get_user_account(&sub_account).await?;
@@ -638,11 +651,10 @@ impl AppState {
             PlaceOrderType::Tx => {
                 let orders = orders_iter
                     .map(|o| {
-                        let base_decimals =
-                            get_market_decimals(self.client.program_data(), o.market);
-                        o.to_order_params(base_decimals)
+                        let base_decimals = market_decimals(self.client.program_data(), o.market)?;
+                        Ok(o.to_order_params(base_decimals))
                     })
-                    .collect();
+                    .collect::<GatewayResult<Vec<OrderParams>>>()?;
                 let tx = TransactionBuilder::new(
                     self.client.program_data(),
                     sub_account,
@@ -662,27 +674,39 @@ impl AppState {
             PlaceOrderType::SignedMsg => {
                 let orders_len = orders_iter.len();
                 let mut signed_messages = Vec::with_capacity(orders_len);
-                let mut hashes: Vec<String> = Vec::with_capacity(orders_len);
+                let mut results = Vec::<(String, String)>::with_capacity(orders_len);
                 let sub_account_id = ctx.sub_account_id.unwrap_or(self.default_sub_account_id());
+
+                // the subscriber starts at slot 0; signing against it would stamp
+                // every order stale-on-arrival until the first update lands
                 let current_slot = self.slot_subscriber.current_slot();
-                let orders_with_hex: Vec<(OrderParams, Vec<u8>)> = orders_iter
+                if current_slot == 0 {
+                    return Err(ControllerError::Unavailable(
+                        "slot subscription not ready, retry shortly".to_string(),
+                    ));
+                }
+
+                // a delegate must sign the delegate message form, which identifies the
+                // taker by sub-account address rather than id
+                let signer = if self.wallet.is_delegated() {
+                    SwiftSigner::Delegate {
+                        taker_pubkey: self.wallet.sub_account(sub_account_id),
+                    }
+                } else {
+                    SwiftSigner::Authority { sub_account_id }
+                };
+
+                let orders_with_hex: Vec<(OrderParams, String, Vec<u8>)> = orders_iter
                     .map(|order| {
                         let base_decimals =
-                            get_market_decimals(self.client.program_data(), order.market);
-                        let order_for_signing_hex = order.clone();
+                            market_decimals(self.client.program_data(), order.market)?;
                         let order_params = order.to_order_params(base_decimals);
-                        (
-                            order_params,
-                            order_for_signing_hex.to_signed_order_hex(
-                                order_params,
-                                current_slot,
-                                sub_account_id,
-                            ),
-                        )
+                        let (uuid, hex) = to_signed_order_hex(order_params, current_slot, signer);
+                        Ok((order_params, uuid, hex))
                     })
-                    .collect();
+                    .collect::<GatewayResult<Vec<_>>>()?;
 
-                for (order, message) in orders_with_hex {
+                for (order, uuid, message) in orders_with_hex {
                     let signature = self.wallet.sign_message(message.as_slice())?;
                     let market_type: &'static str = match order.market_type {
                         MarketType::Spot => "spot",
@@ -691,26 +715,25 @@ impl AppState {
                     let incoming_msg = IncomingSignedMessage {
                         taker_authority: self.authority().to_string(),
                         signature: base64::prelude::BASE64_STANDARD.encode(signature),
-                        message: String::from_utf8(message).unwrap(),
+                        // the payload is hex, always valid utf8
+                        message: String::from_utf8(message).expect("hex is utf8"),
                         signing_authority: self.signer().to_string(),
                         market_type,
                         market_index: order.market_index,
                     };
 
                     signed_messages.push(incoming_msg);
-                    let hash = digest(signature.as_ref());
-                    hashes.push(hash);
+                    results.push((digest(signature.as_ref()), uuid));
                 }
 
-                let client = reqwest::Client::new();
-
-                let swift_orders_url = self.swift_node.clone() + "/orders";
+                let client = &self.swift_client;
+                let swift_orders_url: &str = self.swift_orders_url.as_ref();
 
                 let mut futures = FuturesOrdered::new();
                 for msg in signed_messages {
                     let future =
                         client
-                            .post(&swift_orders_url)
+                            .post(swift_orders_url)
                             .json(&msg)
                             .send()
                             .then(|resp| async move {
@@ -719,11 +742,13 @@ impl AppState {
                                         let status = response.status();
                                         let response_text =
                                             response.text().await.unwrap_or_default();
-                                        (status.to_string(), response_text)
+                                        (status.to_string(), status.is_success(), response_text)
                                     }
-                                    Err(e) => {
-                                        ("500".to_string(), format!("swift server error: {:?}", e))
-                                    }
+                                    Err(e) => (
+                                        "500".to_string(),
+                                        false,
+                                        format!("swift server error: {e:?}"),
+                                    ),
                                 }
                             });
                     futures.push_back(future);
@@ -732,13 +757,19 @@ impl AppState {
                 let responses: Vec<_> = futures.collect().await;
 
                 let signed_msg = SignedMsgResponse {
-                    results: hashes
-                        .iter()
+                    results: results
+                        .into_iter()
                         .zip(responses)
-                        .map(|(hash, (status, response))| SignedMsgOrderResult {
-                            hash: hash.clone(),
-                            status: status.clone(),
-                            error: Some(response.clone()),
+                        .map(|((hash, uuid), (status, is_success, response))| {
+                            SignedMsgOrderResult {
+                                hash,
+                                uuid,
+                                status,
+                                // NB: only populate `error` on failure. it used to carry the
+                                // success body too, so callers checking for a non-null `error`
+                                // saw every accepted order as failed.
+                                error: (!is_success).then_some(response),
+                            }
                         })
                         .collect(),
                 };
@@ -770,16 +801,8 @@ impl AppState {
     pub async fn swap(&self, ctx: Context, req: SwapRequest) -> GatewayResult<TxResponse> {
         let sub_account = self.resolve_sub_account(ctx.sub_account_id);
 
-        let in_market = self
-            .client
-            .program_data()
-            .spot_market_config_by_index(req.input_market)
-            .unwrap();
-        let out_market = self
-            .client
-            .program_data()
-            .spot_market_config_by_index(req.output_market)
-            .unwrap();
+        let in_market = self.spot_market_config(req.input_market, "inputMarket")?;
+        let out_market = self.spot_market_config(req.output_market, "outputMarket")?;
 
         let (swap_mode, amount) = if req.exact_in {
             (
@@ -838,16 +861,8 @@ impl AppState {
     ) -> GatewayResult<TxResponse> {
         let sub_account = self.resolve_sub_account(ctx.sub_account_id);
 
-        let in_market = self
-            .client
-            .program_data()
-            .spot_market_config_by_index(req.input_market)
-            .unwrap();
-        let out_market = self
-            .client
-            .program_data()
-            .spot_market_config_by_index(req.output_market)
-            .unwrap();
+        let in_market = self.spot_market_config(req.input_market, "inputMarket")?;
+        let out_market = self.spot_market_config(req.output_market, "outputMarket")?;
 
         let (swap_mode, amount) = if req.exact_in {
             (
@@ -935,7 +950,7 @@ impl AppState {
                             let sub_account = self.resolve_sub_account(ctx.sub_account_id);
                             for (tx_idx, log) in logs.iter().enumerate() {
                                 if let Some(evt) = try_parse_log(log.as_str(), tx_sig, tx_idx) {
-                                    let (_, gw_event) = map_drift_event_for_account(
+                                    let (_, gw_event) = map_velocity_event_for_account(
                                         self.client.program_data(),
                                         &evt,
                                         sub_account,
@@ -1017,6 +1032,16 @@ impl AppState {
         self.sub_account_ids[0]
     }
 
+    /// Look up a spot market config by caller-supplied index
+    ///
+    /// `field` names the request field for the error message.
+    fn spot_market_config(&self, market_index: u16, field: &str) -> GatewayResult<&SpotMarket> {
+        self.client
+            .program_data()
+            .spot_market_config_by_index(market_index)
+            .ok_or_else(|| ControllerError::BadRequest(format!("invalid {field}: {market_index}")))
+    }
+
     fn get_priority_fee(&self) -> u64 {
         self.priority_fee_subscriber.priority_fee_nth(0.9)
     }
@@ -1081,13 +1106,12 @@ impl AppState {
         let tx_signature = sig;
         let extra_rpcs = self.extra_rpcs.clone();
         tokio::spawn(async move {
-            let start = SystemTime::now();
+            // NB: `Instant` is monotonic. `SystemTime` here meant an NTP step could
+            // make `duration_since` fail and silently abandon the tx mid-retry.
+            let start = Instant::now();
             let ttl = Duration::from_secs(ttl.unwrap_or(DEFAULT_TX_TTL) as u64);
             let mut confirmed = false;
-            while SystemTime::now()
-                .duration_since(start)
-                .is_ok_and(|x| x < ttl)
-            {
+            while start.elapsed() < ttl {
                 let mut futs = FuturesUnordered::new();
                 for rpc in extra_rpcs.iter() {
                     futs.push(rpc.send_transaction_with_config(&tx, tx_config));
@@ -1125,7 +1149,7 @@ impl AppState {
 fn handle_tx_err(err: SdkError) -> ControllerError {
     if let Some(program_err) = err.to_anchor_error_code() {
         match program_err {
-            ProgramError::Drift(code) => ControllerError::TxFailed {
+            ProgramError::Velocity(code) => ControllerError::TxFailed {
                 reason: code.name(),
                 code: code.into(),
             },
@@ -1139,7 +1163,14 @@ fn handle_tx_err(err: SdkError) -> ControllerError {
     }
 }
 
-/// helper to transform CancelOrdersRequest into its drift program ix
+/// Market decimals for a caller-supplied market, as a gateway error if unknown
+fn market_decimals(program_data: &ProgramData, market: Market) -> GatewayResult<u32> {
+    get_market_decimals(program_data, market).ok_or_else(|| {
+        ControllerError::BadRequest(format!("invalid spot marketIndex: {}", market.market_index))
+    })
+}
+
+/// helper to transform CancelOrdersRequest into its velocity program ix
 fn build_cancel_ix(
     builder: TransactionBuilder<'_>,
     req: CancelOrdersRequest,
@@ -1182,7 +1213,7 @@ fn build_modify_ix<'a>(
     if by_user_order_ids {
         let mut params = Vec::<(u8, ModifyOrderParams)>::with_capacity(req.orders.len());
         for order in req.orders {
-            let base_decimals = get_market_decimals(program_data, order.market);
+            let base_decimals = market_decimals(program_data, order.market)?;
             params.push((
                 order.user_order_id.ok_or(ControllerError::BadRequest(
                     "userOrderId not set".to_string(),
@@ -1194,7 +1225,7 @@ fn build_modify_ix<'a>(
     } else {
         let mut params = Vec::<(u32, ModifyOrderParams)>::with_capacity(req.orders.len());
         for order in req.orders {
-            let base_decimals = get_market_decimals(program_data, order.market);
+            let base_decimals = market_decimals(program_data, order.market)?;
             params.push((
                 order
                     .order_id
@@ -1220,12 +1251,12 @@ pub fn create_wallet(
         (Some(secret_key), _, None) => Wallet::try_from_str(secret_key).expect("valid key"),
         (Some(secret_key), _, Some(delegate)) => {
             let keypair =
-                drift_rs::utils::load_keypair_multi_format(secret_key).expect("valid key");
+                velocity_rs::utils::load_keypair_multi_format(secret_key).expect("valid key");
             Wallet::delegated(keypair, delegate)
         }
         (None, Some(emulate), None) => Wallet::read_only(emulate),
         _ => {
-            panic!("expected 'DRIFT_GATEWAY_KEY' or --emulate <pubkey>");
+            panic!("expected 'VELOCITY_GATEWAY_KEY' or --emulate <pubkey>");
         }
     }
 }

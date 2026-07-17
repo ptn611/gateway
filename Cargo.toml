@@ -1,12 +1,12 @@
 [package]
-name = "drift-gateway"
+name = "velocity-gateway"
 version = "1.5.5"
 edition = "2021"
 
 [dependencies]
 actix-web = "*"
 argh = "*"
-drift-rs = { git = "https://github.com/velocity-exchange/drift-rs", rev = "0618036", features = ["titan"] }
+velocity-rs = { git = "https://github.com/velocity-exchange/velocity-v1", rev = "c9819d0", features = ["titan"] }
 base64 = "0.22.1"
 env_logger = "*"
 faster-hex = "0.10.0"
@@ -18,13 +18,14 @@ rust_decimal = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 sha256 = "1.6.0"
-solana-account-decoder-client-types = "2"
-solana-rpc-client-api = "2"
-solana-sdk = "2"
-solana-transaction-status = "2"
+solana-account-decoder-client-types = "3"
+solana-rpc-client-api = "3"
+solana-transaction-status = "3"
 thiserror = "*"
 tokio = {version ="*", features = ["full"]}
 tokio-tungstenite = "*"
 
 [profile.release]
-panic = 'abort'
+# NB: do not set `panic = 'abort'` here. actix-web isolates a panicking request
+# handler and returns 500; aborting turns any such panic into a process-wide
+# outage, taking every other in-flight request and subscription down with it.

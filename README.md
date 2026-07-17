@@ -1,6 +1,6 @@
-# Drift Gateway
+# Velocity Gateway
 
-Self hosted API gateway to easily interact with Drift V2 Protocol
+Self hosted API gateway to easily interact with Velocity Protocol
 
 ## Table of Contents
 1. [Build & Run](#build--run)
@@ -28,6 +28,7 @@ Self hosted API gateway to easily interact with Drift V2 Protocol
       - [`POST` Leverage](#set-leverage)
       - [`GET` Collateral](#get-collateral)
       - [`POST` Place Orders](#place-orders)
+      - [`POST` Swift (signed message) Orders](#swift-signed-message-orders)
       - [`PATCH` Modify Orders](#modify-orders)
       - [`DELETE` Cancel Orders](#cancel-orders)
       - [`POST` Swap](#swap-orders)
@@ -41,7 +42,7 @@ Self hosted API gateway to easily interact with Drift V2 Protocol
 
 ## Build & Run
 
-⚠️ Before starting, ensure a Drift _user_ account is initialized e.g. via the drift app at https://beta.drift.trade (devnet) or https://app.drift.trade
+⚠️ Before starting, ensure a Velocity _user_ account is initialized e.g. via the velocity app at https://beta.velocity.exchange (devnet) or https://app.velocity.exchange
 
 ### From Docker
 
@@ -51,11 +52,11 @@ Use prebuilt image, ghcr.io:
 docker login -u <GITHUB_USERNAME> -P <GITHUB_PAT_TOKEN>
 # run image
 docker run \
-  -e DRIFT_GATEWAY_KEY=<BASE58_SEED> \
+  -e VELOCITY_GATEWAY_KEY=<BASE58_SEED> \
   -p 8080:8080 \
   --platform linux/x86_64 \
   ghcr.io/velocity-exchange/gateway https://rpc-provider.example.com --host 0.0.0.0 \
-  --markets wbtc,drift
+  --markets sol-perp,sol
   --extra-rpcs https://api.mainnet-beta.solana.com
 ```
 
@@ -65,47 +66,41 @@ Build the Docker image:
 # NOTE: '--platform linux/x86_64' ensures the correct memory layout at runtime
 # for solana program data types
 
-docker build -f Dockerfile . -t drift-gateway --platform linux/x86_64
+docker build -f Dockerfile . -t velocity-gateway --platform linux/x86_64
 ```
 
 Run the image:
 
 ```bash
 docker run \
-  -e DRIFT_GATEWAY_KEY=<BASE58_SEED> \
+  -e VELOCITY_GATEWAY_KEY=<BASE58_SEED> \
   -e RUST_LOG=info \
   -p 8080:8080 \
-  drift-gateway https://api.mainnet-beta.solana.com --host 0.0.0.0 --markets wbtc,drift
+  velocity-gateway https://api.mainnet-beta.solana.com --host 0.0.0.0 --markets sol-perp,sol
 ```
 
 ### From Source
 
 Build:
 
-Supports latest rust stable (⚠️ requires an `x86_64` toolchain)
+Supports latest rust stable (requires `1.89` or newer)
 
 ```bash
-# e.g for linux-gnu
-rustup install 1.76.0-x86_64-unknown-linux-gnu      # install old toolchain required to build drift-ffi-sys
-rustup override set stable-x86_64-unknown-linux-gnu # latest stable x86_64 toolchain
-
 cargo build --release
-# On linux. run `ldconfig` to ensure libdrift is linked after build
-ldconfig
 ```
 
 Run:
 ```bash
 # configure the gateway signing key
-export DRIFT_GATEWAY_KEY=</PATH/TO/KEY.json | seedBase58>
+export VELOCITY_GATEWAY_KEY=</PATH/TO/KEY.json | seedBase58>
 
 # '--dev' to toggle devnet markets (default is mainnet)
 # ensure the RPC node is also using the matching devnet or mainnet
-drift-gateway --dev https://api.devnet.solana.com
+velocity-gateway --dev https://api.devnet.solana.com
 
 # or mainnet
 # NB: `api.mainnet-beta.solana.com` is not recommend for production use cases
-drift-gateway https://rpc-provider.example.com --markets sol-perp,sol,weth
+velocity-gateway https://rpc-provider.example.com --markets sol-perp,sol,btc-perp
 ```
 
 ## gRPC mode
@@ -113,12 +108,12 @@ Run gateway subscriptions with geyser gRPC updates
 ```bash
 export GRPC_HOST="grpc.example.com"
 export GRPC_X_TOKEN="aabbccddeeff112233"
-drift-gateway https://rpc-provider.example.com --grpc
+velocity-gateway https://rpc-provider.example.com --grpc
 ```
 
 ## Usage
 
-⚠️ Before starting, ensure a Drift _user_ account is initialized e.g. via the drift app at https://beta.drift.trade (devnet) or https://app.drift.trade
+⚠️ Before starting, ensure a Velocity _user_ account is initialized e.g. via the velocity app at https://beta.velocity.exchange (devnet) or https://app.velocity.exchange
 
 ### Environment Variables
 
@@ -126,7 +121,7 @@ These runtime environment variables are required:
 
 | Variable            | Description                               | Example Value                |
 |---------------------|-------------------------------------------|------------------------------|
-| `DRIFT_GATEWAY_KEY` | Path to your key file or seed in Base58. Transactions will be signed with this keypair | `</PATH/TO/KEY.json>` or `seedBase58` |
+| `VELOCITY_GATEWAY_KEY` | Path to your key file or seed in Base58. Transactions will be signed with this keypair | `</PATH/TO/KEY.json>` or `seedBase58` |
 | `GRPC_HOST` | endpoint for gRPC subscription mode | `https://grpc.example.com`
 | `GRPC_X_TOKEN` | authentication token for gRPC subscription mode | `aabbccddeeff112233`
 | `INIT_RPC_THROTTLE` | Adds a delay (seconds) between RPC bursts during gateway startup. Useful to avoid 429/rate-limit errors. Can be set to `0`, if RPC node is highspec | `1` |
@@ -136,17 +131,19 @@ These runtime environment variables are required:
 | `TITAN_BASE_URL` | (Optional) Titan API base URL | `https://api.titan.exchange` |
 
 ```bash
-./target/release/drift-gateway --help
-Usage: drift-gateway <rpc_host> [--markets <markets>] [--dev] [--host <host>] [--port <port>] [--ws-port <ws-port>] [--keep-alive-timeout <keep-alive-timeout>] [--delegate <delegate>] [--emulate <emulate>] [--tx-commitment <tx-commitment>] [--commitment <commitment>] [--default-sub-account-id <default-sub-account-id>] [--skip-tx-preflight] [--extra-rpcs <extra-rpcs>] [--verbose] [--grpc]
+./target/release/velocity-gateway --help
+Usage: velocity-gateway <rpc_host> [--markets <markets>] [--swift-node <swift-node>] [--dev] [--host <host>] [--port <port>] [--ws-port <ws-port>] [--keep-alive-timeout <keep-alive-timeout>] [--delegate <delegate>] [--emulate <emulate>] [--tx-commitment <tx-commitment>] [--commitment <commitment>] [--default-sub-account-id <default-sub-account-id>] [--active-sub-accounts <active-sub-accounts>] [--skip-tx-preflight] [--extra-rpcs <extra-rpcs>] [--verbose] [--grpc]
 
-Drift gateway server
+Velocity gateway server
 
 Positional Arguments:
   rpc_host          the solana RPC URL
 
 Options:
-  --markets         list of markets to trade e.g '--markets sol-perp,wbtc,pyusd'
-                    gateway creates market subscriptions for responsive trading
+  --markets         list of markets to trade e.g '--markets
+                    sol-perp,sol,btc-perp' gateway creates market subscriptions
+                    for responsive trading
+  --swift-node      swift node url
   --dev             run in devnet mode
   --host            gateway host address
   --port            gateway port
@@ -154,16 +151,17 @@ Options:
   --keep-alive-timeout
                     http keep-alive timeout in seconds
   --delegate        use delegated signing mode provide the delegator's pubkey
-                    (i.e the main account) 'DRIFT_GATEWAY_KEY' should be set to
-                    the delegate's private key
+                    (i.e the main account) 'VELOCITY_GATEWAY_KEY' should be set
+                    to the delegate's private key
   --emulate         run the gateway in read-only mode for given authority pubkey
   --tx-commitment   solana commitment level to use for transaction confirmation
                     (default: confirmed)
   --commitment      solana commitment level to use for state updates (default:
                     confirmed)
   --default-sub-account-id
-                    default sub_account_id to use as default. Use the new active-sub-accounts param to subscribe to multiple sub accounts. This param will override active-sub-accounts.
-  --active-sub-accounts sub accounts to subscribe to. (default: 0)
+                    default sub_account_id to use (default: 0)
+  --active-sub-accounts
+                    list of active sub_account_ids to use (default: 0)
   --skip-tx-preflight
                     skip tx preflight checks
   --extra-rpcs      extra solana RPC urls for improved Tx broadcast
@@ -176,10 +174,10 @@ Options:
 
 Passing the `--delegate <DELEGATOR_PUBKEY>` flag will instruct the gateway to run in delegated signing mode.
 
-In this mode, the gateway will act for `DELEGATOR_PUBKEY` and sub-accounts while signing with the key provided via `DRIFT_GATEWAY_KEY` (i.e delegate key).
+In this mode, the gateway will act for `DELEGATOR_PUBKEY` and sub-accounts while signing with the key provided via `VELOCITY_GATEWAY_KEY` (i.e delegate key).
 
-Use the drift UI or Ts/Python SDK to assign a delegator key.
-see [Delegated Accounts](https://docs.drift.trade/delegated-accounts) for more information.
+Use the velocity UI or Ts/Python SDK to assign a delegator key.
+see [Delegated Accounts](https://docs.velocity.exchange/delegated-accounts) for more information.
 
 ### Sub-account Switching
 
@@ -187,7 +185,11 @@ By default the gateway will perform all account operations on sub-account 0, you
 
 A `subAccountId` URL query parameter may be supplied to switch the sub-account per request basis.
 
-e.g `http://<gateway>/v1/orders?subAccountId=3` will return orders for the wallet's sub-account 3
+e.g `http://<gateway>/v2/orders?subAccountId=3` will return orders for the wallet's sub-account 3
+
+Sub-accounts to subscribe to on startup are set with `--active-sub-accounts 1,2,3`. The
+`--default-sub-account-id` is always included and is the one used when a request omits
+`subAccountId`.
 
 ## Emulation Mode
 
@@ -195,7 +197,7 @@ Passing the `--emulate <EMULATED_PUBKEY>` flag will instruct the gateway to run 
 
 The gateway will receive all events, positions, etc. as normal but be unable to send transactions.
 
-note therefore `DRIFT_GATEWAY_KEY` is not required to be set.
+note therefore `VELOCITY_GATEWAY_KEY` is not required to be set.
 
 ## CU Price & Limits
 
@@ -206,7 +208,7 @@ note therefore `DRIFT_GATEWAY_KEY` is not required to be set.
 The following error is logged when a tx does not have enough CU limit, increasing the cu limit can fix it or reducing number complexity of the order e..g number of orders/markets per batch.
 
 ```bash
-"Program dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH failed: exceeded CUs meter at BPF instruction"]), accounts: None, units_consumed: Some(1000), return_data: None }) })
+"Program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P failed: exceeded CUs meter at BPF instruction"]), accounts: None, units_consumed: Some(1000), return_data: None }) })
 ```
 
 **example request**
@@ -224,7 +226,7 @@ User's can poll `transactionEvent` to confirm success by signature or watch Ws e
 
 Gateway will resubmit txs until they are either confirmed by the network or timeout.  
 This allows gateway txs to have a higher chance of confirmation during busy network periods.  
-setting `?ttl=<TIMEOUT_IN_SECS>` on a request determines how long gateway will resubmit txs for, (default: 4s/~10 slots). 
+setting `?ttl=<TIMEOUT_IN_SECS>` on a request determines how long gateway will resubmit txs for, (default: 6s/~15 slots). 
 e.g. `ttl?=2` means that the tx will be rebroadcast over the next 5 slots (5 * 400ms).  
 
 ⚠️ users should take care to set either `max_order` ts or use atomic place/cancel/modify requests to prevent
@@ -247,7 +249,7 @@ $ curl 'localhost:8080/v2/orders?ttl=2' -X POST \
 
 ## API Examples
 
-Please refer to https://velocity-exchange.github.io/v2-teacher/ for further examples and reference documentation on various types, fields, and operations available on drift.
+Please refer to https://velocity-exchange.github.io/v2-teacher/ for further examples and reference documentation on various types, fields, and operations available on velocity.
 
 ### HTTP API
 
@@ -376,8 +378,8 @@ $ curl localhost:8080/v2/marketInfo/0
 
 To query or stream orderbooks via WebSocket, public DLOB servers are available at:
 
-- devnet: `wss://master.dlob.drift.trade/ws`
-- mainnet: `wss://dlob.drift.trade/ws`
+- devnet: `wss://dlob.master.velocity.exchange/ws`
+- mainnet: `wss://dlob.velocity.exchange/ws`
 
 see https://github.com/velocity-exchange/dlob-server/blob/master/example/wsClient.ts for usage example
 
@@ -570,7 +572,7 @@ A response for a transaction that was confirmed onchain but failed execution e.g
 full list of error codes [here](https://velocity-exchange.github.io/v2-teacher/#errors)
 
 ### Get SOL balance
-Return the on-chain SOL balance of the transaction signer (`DRIFT_GATEWAY_KEY`)
+Return the on-chain SOL balance of the transaction signer (`VELOCITY_GATEWAY_KEY`)
 ```bash
 $ curl localhost:8080/v2/balance
 ```
@@ -580,7 +582,8 @@ $ curl localhost:8080/v2/balance
 ```
 
 ### Get Authority
-Return the on-chain SOL balance of the transaction signer (`DRIFT_GATEWAY_KEY`)
+Return the authority pubkey the gateway is acting for. In delegated signing mode this is
+the delegator, not the key set in `VELOCITY_GATEWAY_KEY`.
 ```bash
 $ curl localhost:8080/v2/authority
 ```
@@ -628,6 +631,72 @@ $ curl localhost:8080/v2/orders -X POST \
 ```
 
 Returns solana tx signature on success
+
+### Swift (signed message) Orders
+
+Setting `"placeOrderType": "swift"` submits orders to the swift node as signed messages
+instead of sending a transaction. The gateway signs each order locally and forwards it;
+no solana tx is built and no tx signature is returned.
+
+`"placeOrderType": "tx"` is the default and produces the normal transaction flow above.
+
+The swift node url is set with `--swift-node`, defaulting to the mainnet node, or the
+devnet node when `--dev` is passed.
+
+```bash
+$ curl localhost:8080/v2/orders -X POST \
+-H 'content-type: application/json' \
+-d '{
+    "placeOrderType": "swift",
+    "orders": [
+    {
+        "marketIndex": 0,
+        "marketType": "perp",
+        "amount": 1.23,
+        "price": 99.0,
+        "orderType": "limit",
+        "userOrderId": 102
+    }]
+}'
+```
+
+**Response**
+
+One result per submitted order, in request order.
+
+- `uuid` identifies the order to the swift node
+- `hash` is the sha256 of the order signature
+- `status` is the swift node's HTTP status for that order
+- `error` is only present when the order was **not** accepted
+
+```json
+{
+  "results": [
+    {
+      "hash": "1b4f0e9851971998e732078544c96b36c3d01cedf7caa332359d6f1d83567014",
+      "uuid": "V1StGXR8",
+      "status": "200 OK"
+    }
+  ]
+}
+```
+
+Swift orders are signed against the current slot. If the gateway has not yet received a
+slot from its subscription (briefly, at startup) it returns `503` rather than signing a
+stale order:
+
+```json
+{
+  "code": 503,
+  "reason": "slot subscription not ready, retry shortly"
+}
+```
+
+Delegated signing is supported: when `--delegate` is set the gateway emits the delegate
+message form, signed with the delegate key.
+
+Not yet supported: take-profit / stop-loss params, builder codes, and
+`isolatedPositionDeposit`.
 
 ### Modify Orders
 
@@ -835,7 +904,7 @@ Websocket API is provided for live event streams by default at port `127.0.0.1:1
 
 ### Subscribing
 
-Subscribe to order and fills updates by a `subAccountId` (`0` is the drift default)
+Subscribe to order and fills updates by a `subAccountId` (`0` is the velocity default)
 
 ```ts
 {"method":"subscribe", "subAccountId":0}
@@ -1040,14 +1109,21 @@ error responses have the following JSON structure:
 }
 ```
 
-Some endpoints send transactions to the drift program and can return program error codes.
-The full list of drift program error codes is available in the [API docs](https://velocity-exchange.github.io/v2-teacher/#errors)
+Some endpoints send transactions to the velocity program and can return program error codes.
+The full list of velocity program error codes is available in the [API docs](https://velocity-exchange.github.io/v2-teacher/#errors)
+
+| code  | meaning                                                                  |
+|-------|--------------------------------------------------------------------------|
+| `400` | malformed request, or an unknown `marketIndex`                             |
+| `404` | transaction not found (`transactionEvent` only)                           |
+| `500` | internal/RPC error, or a velocity program error code                      |
+| `503` | gateway not ready to serve the request yet, safe to retry                 |
 
 ### FAQ
 
 #### `AccountNotFound`
 
-Usually means the drift user (sub)account has not been initialized.
+Usually means the velocity user (sub)account has not been initialized.
 Use the UI or Ts/Python sdk to initialize the sub-account first.
 
 ```json
@@ -1059,7 +1135,7 @@ Use the UI or Ts/Python sdk to initialize the sub-account first.
 
 #### `429`s / gateway hitting RPC rate limits
 
-this can occur during gateway startup as drift market data is pulled from the network and subscriptions are initialized.  
+this can occur during gateway startup as velocity market data is pulled from the network and subscriptions are initialized.  
 try setting `INIT_RPC_THROTTLE=2` for e.g. 2s or longer, this allows some time between request bursts on start up.  
 
 The free \_api.mainnet-beta.solana.com_ RPC support is limited due to rate-limits

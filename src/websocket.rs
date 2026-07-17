@@ -1,13 +1,7 @@
 //! Websocket server
 
-use std::{collections::HashMap, ops::Neg, sync::Arc};
+use std::{collections::HashMap, ops::Neg, sync::Arc, time::Duration};
 
-use drift_rs::{
-    constants::ProgramData,
-    event_subscriber::{DriftEvent, EventSubscriber, PubsubClient},
-    types::{MarketType, Order, OrderType, PositionDirection},
-    Pubkey, Wallet,
-};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
 use rust_decimal::Decimal;
@@ -20,11 +14,25 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use velocity_rs::{
+    constants::ProgramData,
+    event_subscriber::{EventSubscriber, PubsubClient, VelocityEvent},
+    types::{MarketType, OrderType, PositionDirection},
+    velocity_idl::types::{
+        MarketType as IdlMarketType, Order as IdlOrder, OrderType as IdlOrderType,
+        PositionDirection as IdlPositionDirection,
+    },
+    Pubkey, Wallet,
+};
 
 use crate::{
     types::{get_market_decimals, Market, PRICE_DECIMALS},
     LOG_TARGET,
 };
+
+/// bounds for event-subscription reconnect backoff
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 /// Start the websocket server
 pub async fn start_ws_server(
@@ -56,7 +64,14 @@ async fn accept_connection(
     wallet: Arc<Wallet>,
     program_data: &'static ProgramData,
 ) {
-    let addr = stream.peer_addr().expect("peer address");
+    // a peer that resets before we read the address is routine, not fatal
+    let addr = match stream.peer_addr() {
+        Ok(addr) => addr,
+        Err(err) => {
+            debug!(target: LOG_TARGET, "no peer address, dropping connection: {err}");
+            return;
+        }
+    };
 
     // Check for WebSocket upgrade header before accept_async consumes the stream
     let mut buf = [0u8; 1024];
@@ -101,7 +116,11 @@ async fn accept_connection(
                 debug!(target: LOG_TARGET, "closing Ws connection (send half): {}", addr);
                 break;
             }
-            ws_out.send(msg).await.expect("sent");
+            // a client that disconnects mid-write is routine, not fatal
+            if let Err(err) = ws_out.send(msg).await {
+                debug!(target: LOG_TARGET, "Ws send failed, dropping connection: {addr}: {err}");
+                break;
+            }
         }
     });
 
@@ -116,7 +135,7 @@ async fn accept_connection(
                             let mut subscription_map = subscriptions.lock().await;
                             if subscription_map.contains_key(&request.sub_account_id) {
                                 info!(target: LOG_TARGET, "subscription already exists for: {}", request.sub_account_id);
-                                message_tx
+                                if message_tx
                                     .send(Message::text(
                                         json!({
                                             "error": "bad request",
@@ -125,7 +144,10 @@ async fn accept_connection(
                                         .to_string(),
                                     ))
                                     .await
-                                    .unwrap();
+                                    .is_err()
+                                {
+                                    break;
+                                }
                                 continue;
                             }
                             info!(target: LOG_TARGET, "subscribing to events for: {}", request.sub_account_id);
@@ -138,7 +160,11 @@ async fn accept_connection(
                                 let message_tx = message_tx.clone();
 
                                 async move {
-                                    loop {
+                                    // reconnects are backed off: a stream that ends
+                                    // immediately would otherwise spin, hammering the
+                                    // RPC node with resubscribes.
+                                    let mut backoff = RECONNECT_BACKOFF_MIN;
+                                    'reconnect: loop {
                                         let mut event_stream = match EventSubscriber::subscribe(
                                             Arc::clone(&ws_client_ref),
                                             sub_account_address,
@@ -148,13 +174,15 @@ async fn accept_connection(
                                             Ok(stream) => stream,
                                             Err(err) => {
                                                 log::error!(target: LOG_TARGET, "event subscribe failed: {sub_account_id:?}, {err:?}");
-                                                break;
+                                                break 'reconnect;
                                             }
                                         };
 
                                         debug!(target: LOG_TARGET, "event stream connected: {sub_account_id:?}");
+                                        let mut got_update = false;
                                         while let Some(ref update) = event_stream.next().await {
-                                            let (channel, data) = map_drift_event_for_account(
+                                            got_update = true;
+                                            let (channel, data) = map_velocity_event_for_account(
                                                 program_data,
                                                 update,
                                                 sub_account_address,
@@ -174,10 +202,23 @@ async fn accept_connection(
                                                 .await
                                                 .is_err()
                                             {
+                                                // the client is gone; resubscribing would
+                                                // loop forever against the RPC node
                                                 warn!(target: LOG_TARGET, "failed sending Ws message: {}", addr);
-                                                break;
+                                                break 'reconnect;
                                             }
                                         }
+
+                                        // only a stream that delivered something counts as
+                                        // healthy; one that ends immediately must back off
+                                        // rather than spin.
+                                        backoff = if got_update {
+                                            RECONNECT_BACKOFF_MIN
+                                        } else {
+                                            (backoff * 2).min(RECONNECT_BACKOFF_MAX)
+                                        };
+                                        debug!(target: LOG_TARGET, "event stream dropped, reconnecting in {backoff:?}: {sub_account_id:?}");
+                                        tokio::time::sleep(backoff).await;
                                     }
                                     warn!(target: LOG_TARGET, "event stream finished: {sub_account_id:?}");
                                     subscription_map.lock().await.remove(&sub_account_id);
@@ -199,7 +240,7 @@ async fn accept_connection(
                     }
                 }
                 Err(err) => {
-                    message_tx
+                    if message_tx
                         .send(Message::text(
                             json!({
                                 "error": "bad request",
@@ -208,7 +249,10 @@ async fn accept_connection(
                             .to_string(),
                         ))
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             },
             Message::Close(frame) => {
@@ -446,8 +490,36 @@ pub(crate) struct OrderWithDecimals {
     pub auction_duration: u8,
 }
 
+/// Events are decoded from the program's anchor logs, so they carry the IDL
+/// enums rather than the program ones used elsewhere. Variants are 1:1.
+fn market_type_from_idl(value: IdlMarketType) -> MarketType {
+    match value {
+        IdlMarketType::Spot => MarketType::Spot,
+        IdlMarketType::Perp => MarketType::Perp,
+    }
+}
+
+/// as [`market_type_from_idl`]
+fn position_direction_from_idl(value: IdlPositionDirection) -> PositionDirection {
+    match value {
+        IdlPositionDirection::Long => PositionDirection::Long,
+        IdlPositionDirection::Short => PositionDirection::Short,
+    }
+}
+
+/// as [`market_type_from_idl`]
+fn order_type_from_idl(value: IdlOrderType) -> OrderType {
+    match value {
+        IdlOrderType::Market => OrderType::Market,
+        IdlOrderType::Limit => OrderType::Limit,
+        IdlOrderType::TriggerMarket => OrderType::TriggerMarket,
+        IdlOrderType::TriggerLimit => OrderType::TriggerLimit,
+        IdlOrderType::Oracle => OrderType::Oracle,
+    }
+}
+
 impl OrderWithDecimals {
-    fn from_order(value: Order, decimals: u32) -> Self {
+    fn from_order(value: IdlOrder, decimals: u32) -> Self {
         Self {
             slot: value.slot,
             price: Decimal::new(value.price as i64, PRICE_DECIMALS).normalize(),
@@ -462,10 +534,10 @@ impl OrderWithDecimals {
             max_ts: value.max_ts,
             order_id: value.order_id,
             market_index: value.market_index,
-            order_type: value.order_type,
-            market_type: value.market_type,
+            order_type: order_type_from_idl(value.order_type),
+            market_type: market_type_from_idl(value.market_type),
             user_order_id: value.user_order_id,
-            direction: value.direction,
+            direction: position_direction_from_idl(value.direction),
             reduce_only: value.reduce_only,
             post_only: value.post_only,
             immediate_or_cancel: value.immediate_or_cancel,
@@ -530,14 +602,14 @@ where
     }
 }
 
-/// Map drift-program events into gateway friendly types for events to the specific UserAccount
-pub(crate) fn map_drift_event_for_account(
+/// Map velocity-program events into gateway friendly types for events to the specific UserAccount
+pub(crate) fn map_velocity_event_for_account(
     program_data: &ProgramData,
-    event: &DriftEvent,
+    event: &VelocityEvent,
     sub_account_address: Pubkey,
 ) -> (Channel, Option<AccountEvent>) {
     match event {
-        DriftEvent::OrderTrigger {
+        VelocityEvent::OrderTrigger {
             user: _,
             order_id,
             oracle_price,
@@ -549,7 +621,7 @@ pub(crate) fn map_drift_event_for_account(
                 oracle_price: *oracle_price,
             }),
         ),
-        DriftEvent::OrderFill {
+        VelocityEvent::OrderFill {
             maker,
             maker_fee,
             maker_order_id,
@@ -568,11 +640,18 @@ pub(crate) fn map_drift_event_for_account(
             ts,
             bit_flags: _,
         } => {
-            let decimals =
-                get_market_decimals(program_data, Market::new(*market_index, *market_type));
+            let market = Market::new(*market_index, market_type_from_idl(*market_type));
+            let Some(decimals) = get_market_decimals(program_data, market) else {
+                warn!(target: LOG_TARGET, "skipping fill for unknown market: {market:?}");
+                return (Channel::Fills, None);
+            };
             let fill = if *maker == Some(sub_account_address) {
+                let Some(side) = maker_side.map(position_direction_from_idl) else {
+                    warn!(target: LOG_TARGET, "skipping fill, maker side unset: {market:?}");
+                    return (Channel::Fills, None);
+                };
                 Some(AccountEvent::fill(
-                    maker_side.unwrap(),
+                    side,
                     *maker_fee,
                     *base_asset_amount_filled,
                     *quote_asset_amount_filled,
@@ -583,7 +662,7 @@ pub(crate) fn map_drift_event_for_account(
                     signature,
                     *tx_idx,
                     *market_index,
-                    *market_type,
+                    market_type_from_idl(*market_type),
                     (*maker).map(|x| x.to_string()),
                     Some(*maker_order_id),
                     Some(*maker_fee),
@@ -592,8 +671,12 @@ pub(crate) fn map_drift_event_for_account(
                     Some(*taker_fee as i64),
                 ))
             } else if *taker == Some(sub_account_address) {
+                let Some(side) = taker_side.map(position_direction_from_idl) else {
+                    warn!(target: LOG_TARGET, "skipping fill, taker side unset: {market:?}");
+                    return (Channel::Fills, None);
+                };
                 Some(AccountEvent::fill(
-                    taker_side.unwrap(),
+                    side,
                     (*taker_fee) as i64,
                     *base_asset_amount_filled,
                     *quote_asset_amount_filled,
@@ -604,7 +687,7 @@ pub(crate) fn map_drift_event_for_account(
                     signature,
                     *tx_idx,
                     *market_index,
-                    *market_type,
+                    market_type_from_idl(*market_type),
                     (*maker).map(|x| x.to_string()),
                     Some(*maker_order_id),
                     Some(*maker_fee),
@@ -618,7 +701,7 @@ pub(crate) fn map_drift_event_for_account(
 
             (Channel::Fills, fill)
         }
-        DriftEvent::OrderCancel {
+        VelocityEvent::OrderCancel {
             taker: _,
             maker,
             taker_order_id,
@@ -642,7 +725,7 @@ pub(crate) fn map_drift_event_for_account(
                 }),
             )
         }
-        DriftEvent::OrderCancelMissing {
+        VelocityEvent::OrderCancelMissing {
             order_id,
             user_order_id,
             signature,
@@ -654,7 +737,7 @@ pub(crate) fn map_drift_event_for_account(
                 signature: signature.clone(),
             }),
         ),
-        DriftEvent::OrderExpire {
+        VelocityEvent::OrderExpire {
             order_id,
             fee,
             ts,
@@ -669,17 +752,18 @@ pub(crate) fn map_drift_event_for_account(
                 signature: signature.to_string(),
             }),
         ),
-        DriftEvent::OrderCreate {
+        VelocityEvent::OrderCreate {
             order,
             ts,
             signature,
             tx_idx,
             ..
         } => {
-            let decimals = get_market_decimals(
-                program_data,
-                Market::new(order.market_index, order.market_type),
-            );
+            let market = Market::new(order.market_index, market_type_from_idl(order.market_type));
+            let Some(decimals) = get_market_decimals(program_data, market) else {
+                warn!(target: LOG_TARGET, "skipping order create for unknown market: {market:?}");
+                return (Channel::Orders, None);
+            };
             (
                 Channel::Orders,
                 Some(AccountEvent::OrderCreate {
@@ -690,7 +774,7 @@ pub(crate) fn map_drift_event_for_account(
                 }),
             )
         }
-        DriftEvent::FundingPayment {
+        VelocityEvent::FundingPayment {
             amount,
             market_index,
             ts,
@@ -707,7 +791,7 @@ pub(crate) fn map_drift_event_for_account(
                 tx_idx: *tx_idx,
             }),
         ),
-        DriftEvent::Swap {
+        VelocityEvent::Swap {
             user,
             amount_in,
             amount_out,
@@ -718,8 +802,13 @@ pub(crate) fn map_drift_event_for_account(
             signature,
             tx_idx,
         } => {
-            let decimals_in = get_market_decimals(program_data, Market::spot(*market_in));
-            let decimals_out = get_market_decimals(program_data, Market::spot(*market_out));
+            let (Some(decimals_in), Some(decimals_out)) = (
+                get_market_decimals(program_data, Market::spot(*market_in)),
+                get_market_decimals(program_data, Market::spot(*market_out)),
+            ) else {
+                warn!(target: LOG_TARGET, "skipping swap for unknown market: {market_in}/{market_out}");
+                return (Channel::Swap, None);
+            };
             (
                 Channel::Swap,
                 Some(AccountEvent::Swap {

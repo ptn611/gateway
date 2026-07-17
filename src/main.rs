@@ -8,13 +8,13 @@ use actix_web::{
     App, Either, HttpResponse, HttpServer, Responder,
 };
 use argh::FromArgs;
-use drift_rs::{
-    types::{CommitmentConfig, MarginRequirementType, MarketId},
-    GrpcSubscribeOpts, Pubkey,
-};
 use log::{debug, info, warn};
 use serde_json::json;
 use types::{SetLeverageRequest, SwapRequest, TitanSwapRequest};
+use velocity_rs::{
+    types::{CommitmentConfig, MarginRequirementType, MarketId},
+    GrpcSubscribeOpts, Pubkey,
+};
 
 use crate::{
     controller::{create_wallet, AppState, ControllerError},
@@ -279,7 +279,7 @@ async fn main() -> std::io::Result<()> {
     }
     .init();
 
-    let secret_key = std::env::var("DRIFT_GATEWAY_KEY");
+    let secret_key = std::env::var("VELOCITY_GATEWAY_KEY");
     let delegate = config
         .delegate
         .map(|ref x| Pubkey::from_str(x).expect("valid pubkey"));
@@ -293,14 +293,9 @@ async fn main() -> std::io::Result<()> {
         .expect("one of: processed | confirmed | finalized");
     let extra_rpcs = config.extra_rpcs.as_ref();
 
-    let mut sub_account_ids = vec![config.default_sub_account_id];
-    sub_account_ids.extend(
-        config
-            .active_sub_accounts
-            .split(",")
-            .map(|s| s.parse::<u16>().unwrap()),
-    );
-    sub_account_ids.dedup();
+    let sub_account_ids =
+        parse_sub_account_ids(config.default_sub_account_id, &config.active_sub_accounts)
+            .expect("valid --active-sub-accounts");
 
     let state = AppState::new(
         &config.rpc_host,
@@ -469,6 +464,15 @@ fn handle_result<T: std::fmt::Debug>(
                 }
             )))
         }
+        // transient: the caller should retry rather than treat this as fatal
+        Err(ControllerError::Unavailable(reason)) => {
+            Either::Left(HttpResponse::ServiceUnavailable().json(json!(
+                {
+                    "code": 503,
+                    "reason": reason,
+                }
+            )))
+        }
     }
 }
 
@@ -491,20 +495,20 @@ fn default_swift_node() -> String {
         });
     let is_dev = strings.iter().any(|s| s.to_string() == "--dev".to_string());
     if is_dev {
-        "https://master.swift.drift.trade".to_string()
+        "https://swift.master.velocity.exchange".to_string()
     } else {
-        "https://swift.drift.trade".to_string()
+        "https://swift.velocity.exchange".to_string()
     }
 }
 
 #[derive(FromArgs)]
-/// Drift gateway server
+/// Velocity gateway server
 struct GatewayConfig {
     /// the solana RPC URL
     #[argh(positional)]
     rpc_host: String,
     /// list of markets to trade
-    /// e.g '--markets sol-perp,wbtc,pyusd'
+    /// e.g '--markets sol-perp,sol,btc-perp'
     /// gateway creates market subscriptions for responsive trading
     #[argh(option)]
     markets: Option<String>,
@@ -528,7 +532,7 @@ struct GatewayConfig {
     keep_alive_timeout: u32,
     /// use delegated signing mode
     /// provide the delegator's pubkey (i.e the main account)
-    /// 'DRIFT_GATEWAY_KEY' should be set to the delegate's private key
+    /// 'VELOCITY_GATEWAY_KEY' should be set to the delegate's private key
     #[argh(option)]
     delegate: Option<String>,
     /// run the gateway in read-only mode for given authority pubkey
@@ -560,8 +564,31 @@ struct GatewayConfig {
     grpc: bool,
 }
 
+/// Build the sub-account id list from the default and the `--active-sub-accounts` list
+///
+/// The default id stays first: [`AppState::default_sub_account_id`] reads index 0.
+/// Duplicates are dropped wherever they appear -- `Vec::dedup` would only catch
+/// adjacent ones, so '--default-sub-account-id 0 --active-sub-accounts 1,0' used
+/// to subscribe to sub-account 0 twice.
+fn parse_sub_account_ids(default: u16, active: &str) -> Result<Vec<u16>, String> {
+    let mut ids = vec![default];
+    for entry in active.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let id: u16 = entry
+            .parse()
+            .map_err(|_| format!("invalid sub_account_id: {entry:?}"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Parse raw markets list from user command
-fn parse_markets(client: &drift_rs::DriftClient, markets: &str) -> Result<Vec<MarketId>, ()> {
+fn parse_markets(client: &velocity_rs::VelocityClient, markets: &str) -> Result<Vec<MarketId>, ()> {
     let mut configured_markets = Vec::<MarketId>::default();
 
     for ticker in markets.split(",") {
@@ -576,6 +603,40 @@ fn parse_markets(client: &drift_rs::DriftClient, markets: &str) -> Result<Vec<Ma
     Ok(configured_markets)
 }
 
+// NB: kept out of `mod tests`, whose `use actix_web::test` shadows the `#[test]`
+// attribute. these need no signing key or RPC, unlike the tests below.
+#[cfg(test)]
+mod sub_account_id_tests {
+    use super::parse_sub_account_ids;
+
+    /// the default id must stay at index 0, it is what `default_sub_account_id` reads
+    #[test]
+    fn keeps_default_first() {
+        assert_eq!(parse_sub_account_ids(3, "1,2").unwrap(), vec![3, 1, 2]);
+    }
+
+    /// regression: `Vec::dedup` only drops *adjacent* duplicates, so a default
+    /// repeated later in the list survived and got subscribed to twice
+    #[test]
+    fn drops_non_adjacent_duplicates() {
+        assert_eq!(parse_sub_account_ids(0, "1,0").unwrap(), vec![0, 1]);
+        assert_eq!(parse_sub_account_ids(0, "0").unwrap(), vec![0]);
+        assert_eq!(parse_sub_account_ids(2, "1,1,2,1").unwrap(), vec![2, 1]);
+    }
+
+    #[test]
+    fn tolerates_whitespace_and_empties() {
+        assert_eq!(parse_sub_account_ids(0, " 1 , 2 ").unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_sub_account_ids(0, "").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn rejects_invalid() {
+        assert!(parse_sub_account_ids(0, "1,abc").is_err());
+        assert!(parse_sub_account_ids(0, "99999999").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use actix_web::{http::Method, test, App};
@@ -584,8 +645,8 @@ mod tests {
     use super::*;
 
     fn get_seed() -> String {
-        std::env::var("DRIFT_GATEWAY_KEY")
-            .expect("DRIFT_GATEWAY_KEY is set")
+        std::env::var("VELOCITY_GATEWAY_KEY")
+            .expect("VELOCITY_GATEWAY_KEY is set")
             .to_string()
     }
 
@@ -605,7 +666,7 @@ mod tests {
             vec![0],
             false,
             vec![],
-            "https://master.swift.drift.trade".to_string(),
+            "https://swift.master.velocity.exchange".to_string(),
         )
         .await
     }
@@ -636,7 +697,7 @@ mod tests {
             vec![0],
             false,
             vec![],
-            "https://master.swift.drift.trade".to_string(),
+            "https://swift.master.velocity.exchange".to_string(),
         )
         .await;
 
@@ -684,7 +745,7 @@ mod tests {
             vec![0],
             false,
             vec![],
-            "https://master.swift.drift.trade".to_string(),
+            "https://swift.master.velocity.exchange".to_string(),
         )
         .await;
 
@@ -727,7 +788,7 @@ mod tests {
             vec![0],
             false,
             vec![],
-            "https://master.swift.drift.trade".to_string(),
+            "https://swift.master.velocity.exchange".to_string(),
         )
         .await;
 
