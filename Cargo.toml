@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 actix-web = "*"
 argh = "*"
-drift-rs = { git = "https://github.com/velocity-exchange/drift-rs", rev = "0618036", features = ["titan"] }
+drift-rs = { path = "../drift-rs", features = ["titan"] }
 base64 = "0.22.1"
 env_logger = "*"
 faster-hex = "0.10.0"
@@ -18,10 +18,10 @@ rust_decimal = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 sha256 = "1.6.0"
-solana-account-decoder-client-types = "2"
-solana-rpc-client-api = "2"
-solana-sdk = "2"
-solana-transaction-status = "2"
+solana-account-decoder-client-types = "3"
+solana-rpc-client-api = "3"
+solana-sdk = "3"
+solana-transaction-status = "3"
 thiserror = "*"
 tokio = {version ="*", features = ["full"]}
 tokio-tungstenite = "*"
