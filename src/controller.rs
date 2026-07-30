@@ -3,12 +3,15 @@ use std::{
     collections::HashSet,
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
+
+#[cfg(not(test))]
+use std::time::SystemTime;
 
 use base64::Engine as _;
 use drift_rs::{
-    constants::{ProgramData, DEFAULT_PUBKEY},
+    constants::ProgramData,
     drift_idl::{self, types::MarginRequirementType},
     event_subscriber::{try_parse_log, CommitmentConfig, RpcClient},
     jupiter::{JupiterSwapApi, SwapMode},
@@ -25,15 +28,21 @@ use drift_rs::{
     titan::{Provider, SwapMode as TitanSwapMode, TitanSwapApi},
     types::{
         self, accounts::SpotMarket, MarketId, MarketType, ModifyOrderParams, OrderParams,
-        OrderStatus, ProgramError, RpcSendTransactionConfig, SdkError, SdkResult, VersionedMessage,
+        OrderStatus, SdkError, SdkResult, VersionedMessage,
     },
     utils::get_http_url,
     DriftClient, Pubkey, TransactionBuilder, Wallet,
 };
+
+#[cfg(not(test))]
+use drift_rs::types::{ProgramError, RpcSendTransactionConfig};
 use futures_util::{
-    stream::{FuturesOrdered, FuturesUnordered},
+    stream::FuturesOrdered,
     FutureExt, StreamExt,
 };
+
+#[cfg(not(test))]
+use futures_util::stream::FuturesUnordered;
 use log::{debug, info, trace, warn};
 use rust_decimal::Decimal;
 use sha256::digest;
@@ -64,6 +73,7 @@ use crate::{
 /// Default TTL in seconds of gateway tx retry
 /// after which gateway will no longer resubmit or monitor the tx
 // ~15 slots
+#[cfg(not(test))]
 const DEFAULT_TX_TTL: u16 = 6;
 
 pub type GatewayResult<T> = Result<T, ControllerError>;
@@ -89,10 +99,12 @@ pub struct AppState {
     /// sub_account_ids to subscribe to
     sub_account_ids: Vec<u16>,
     /// skip tx preflight on send or not (default: false)
+    #[cfg_attr(test, allow(dead_code))]
     skip_tx_preflight: bool,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     slot_subscriber: Arc<SlotSubscriber>,
     /// list of additional RPC endpoints for tx broadcast
+    #[cfg_attr(test, allow(dead_code))]
     extra_rpcs: Vec<Arc<RpcClient>>,
     /// swift node url
     swift_node: String,
@@ -1122,6 +1134,7 @@ impl AppState {
     }
 }
 
+#[cfg(not(test))]
 fn handle_tx_err(err: SdkError) -> ControllerError {
     if let Some(program_err) = err.to_anchor_error_code() {
         match program_err {
