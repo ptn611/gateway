@@ -12,10 +12,9 @@ use drift_rs::{
     },
     swift_order_subscriber::SignedOrderType,
     types::{
-        self as sdk_types,
+        self as sdk_types, MarketPrecision, MarketType, ModifyOrderParams, OrderParams,
+        OrderTriggerCondition, PositionDirection, PostOnlyParam, SignedMsgOrderParamsMessage,
         accounts::{PerpMarket, SpotMarket},
-        MarketPrecision, MarketType, ModifyOrderParams, OrderParams, OrderTriggerCondition,
-        PositionDirection, PostOnlyParam, SignedMsgOrderParamsMessage,
     },
 };
 use nanoid::nanoid;

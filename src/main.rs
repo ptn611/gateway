@@ -1,23 +1,22 @@
 use std::{borrow::Borrow, str::FromStr, sync::Arc, time::Duration};
 
 use actix_web::{
-    delete, get,
+    App, Either, HttpResponse, HttpServer, Responder, delete, get,
     middleware::Logger,
     patch, post,
     web::{self, Json},
-    App, Either, HttpResponse, HttpServer, Responder,
 };
 use argh::FromArgs;
 use drift_rs::{
-    types::{CommitmentConfig, MarginRequirementType, MarketId},
     GrpcSubscribeOpts, Pubkey,
+    types::{CommitmentConfig, MarginRequirementType, MarketId},
 };
 use log::{debug, info, warn};
 use serde_json::json;
 use types::{SetLeverageRequest, SwapRequest, TitanSwapRequest};
 
 use crate::{
-    controller::{create_wallet, AppState, ControllerError},
+    controller::{AppState, ControllerError, create_wallet},
     types::{
         CancelAndPlaceRequest, CancelOrdersRequest, Market, ModifyOrdersRequest, PlaceOrdersRequest,
     },
@@ -578,7 +577,7 @@ fn parse_markets(client: &drift_rs::DriftClient, markets: &str) -> Result<Vec<Ma
 
 #[cfg(test)]
 mod tests {
-    use actix_web::{http::Method, test, App};
+    use actix_web::{App, http::Method, test};
 
     use self::controller::create_wallet;
     use super::*;

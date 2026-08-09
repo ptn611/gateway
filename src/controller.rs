@@ -1,19 +1,14 @@
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{borrow::Cow, collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(not(test))]
 use std::time::SystemTime;
 
 use base64::Engine as _;
 use drift_rs::{
+    DriftClient, Pubkey, TransactionBuilder, Wallet,
     constants::ProgramData,
     drift_idl::{self, types::MarginRequirementType},
-    event_subscriber::{try_parse_log, CommitmentConfig, RpcClient},
+    event_subscriber::{CommitmentConfig, RpcClient, try_parse_log},
     jupiter::{JupiterSwapApi, SwapMode},
     math::{
         constants::{BASE_PRECISION, MARGIN_PRECISION},
@@ -27,19 +22,15 @@ use drift_rs::{
     slot_subscriber::SlotSubscriber,
     titan::{Provider, SwapMode as TitanSwapMode, TitanSwapApi},
     types::{
-        self, accounts::SpotMarket, MarketId, MarketType, ModifyOrderParams, OrderParams,
-        OrderStatus, SdkError, SdkResult, VersionedMessage,
+        self, MarketId, MarketType, ModifyOrderParams, OrderParams, OrderStatus, SdkError,
+        SdkResult, VersionedMessage, accounts::SpotMarket,
     },
     utils::get_http_url,
-    DriftClient, Pubkey, TransactionBuilder, Wallet,
 };
 
 #[cfg(not(test))]
 use drift_rs::types::{ProgramError, RpcSendTransactionConfig};
-use futures_util::{
-    stream::FuturesOrdered,
-    FutureExt, StreamExt,
-};
+use futures_util::{FutureExt, StreamExt, stream::FuturesOrdered};
 
 #[cfg(not(test))]
 use futures_util::stream::FuturesUnordered;
@@ -52,22 +43,22 @@ use solana_rpc_client_api::{
     config::{RpcAccountInfoConfig, RpcTransactionConfig},
 };
 use solana_sdk::signature::Signature;
-use solana_transaction_status::{option_serializer::OptionSerializer, UiTransactionEncoding};
+use solana_transaction_status::{UiTransactionEncoding, option_serializer::OptionSerializer};
 use thiserror::Error;
 
 use crate::{
+    Context, LOG_TARGET,
     types::{
-        get_market_decimals, scale_decimal_to_u64, AllMarketsResponse, AuthorityResponse,
-        CancelAndPlaceRequest, CancelOrdersRequest, GetOrdersRequest, GetOrdersResponse,
-        GetPositionsRequest, GetPositionsResponse, IncomingSignedMessage, Market,
-        MarketInfoResponse, ModifyOrdersRequest, Order, PerpPosition, PerpPositionExtended,
-        PlaceOrderResponse, PlaceOrderType, PlaceOrdersRequest, SignedMsgOrderResult,
-        SignedMsgResponse, SolBalanceResponse, SpotPosition, SwapRequest, TitanSwapRequest,
-        TxEventsResponse, TxResponse, UserCollateralResponse, UserLeverageResponse,
-        UserMarginResponse, PRICE_DECIMALS,
+        AllMarketsResponse, AuthorityResponse, CancelAndPlaceRequest, CancelOrdersRequest,
+        GetOrdersRequest, GetOrdersResponse, GetPositionsRequest, GetPositionsResponse,
+        IncomingSignedMessage, Market, MarketInfoResponse, ModifyOrdersRequest, Order,
+        PRICE_DECIMALS, PerpPosition, PerpPositionExtended, PlaceOrderResponse, PlaceOrderType,
+        PlaceOrdersRequest, SignedMsgOrderResult, SignedMsgResponse, SolBalanceResponse,
+        SpotPosition, SwapRequest, TitanSwapRequest, TxEventsResponse, TxResponse,
+        UserCollateralResponse, UserLeverageResponse, UserMarginResponse, get_market_decimals,
+        scale_decimal_to_u64,
     },
     websocket::map_drift_event_for_account,
-    Context, LOG_TARGET,
 };
 
 /// Default TTL in seconds of gateway tx retry

@@ -3,10 +3,10 @@
 use std::{collections::HashMap, ops::Neg, sync::Arc};
 
 use drift_rs::{
+    Pubkey, Wallet,
     constants::ProgramData,
     event_subscriber::{DriftEvent, EventSubscriber, PubsubClient},
     types::{MarketType, Order, OrderType, PositionDirection},
-    Pubkey, Wallet,
 };
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, warn};
@@ -22,8 +22,8 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::{
-    types::{get_market_decimals, Market, PRICE_DECIMALS},
     LOG_TARGET,
+    types::{Market, PRICE_DECIMALS, get_market_decimals},
 };
 
 /// Start the websocket server
