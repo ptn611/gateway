@@ -1,26 +1,27 @@
+# ---- Build Stage ----
+# Build context is the parent dir holding gateway, drift-rs, drift-ffi-sys and
+# protocol-v2 as siblings (see Cargo.toml path deps and drift-rs build.rs).
 FROM rust:1.85 AS builder
 
 RUN apt-get update && apt-get install -y libgcc1 jq
-WORKDIR /build
+WORKDIR /app
 RUN rustup component add rustfmt
-RUN SO_URL=$(curl -s https://api.github.com/repos/velocity-exchange/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url') &&\
-  curl -L -o libdrift_ffi_sys.so "$SO_URL" &&\
-  cp libdrift_ffi_sys.so /usr/local/lib
 
-COPY  . .
-# DEV: choose to build drift system libs from source or not
-# a) default: use prebuilt lib (faster build time)
-RUN CARGO_DRIFT_FFI_PATH="/usr/local/lib" cargo build --release
-# b) build libdrift_ffi from source (slower build time)
-# RUN rustup install 1.76.0-x86_64-unknown-linux-gnu
-# RUN CARGO_DRIFT_FFI_STATIC=1 cargo build --release
-# RUN ./target/release/drift-gateway --help
+COPY protocol-v2 ./protocol-v2
+COPY drift-ffi-sys ./drift-ffi-sys
+COPY drift-rs ./drift-rs
+COPY gateway ./gateway
 
-RUN cp /lib/x86_64-linux-gnu/libgcc_s.so.1 /build/target/release/
+WORKDIR /app/gateway
+# build libdrift_ffi_sys from source via drift-rs build.rs (../drift-ffi-sys sibling)
+RUN cargo build --release
 
+RUN cp /lib/x86_64-linux-gnu/libgcc_s.so.1 /app/gateway/target/release/
+
+# ---- Runtime Stage ----
 FROM debian:12
-COPY --from=builder /build/target/release/libgcc_s.so.1 /lib/
-COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /lib/
-COPY --from=builder /build/target/release/drift-gateway /bin/drift-gateway
+COPY --from=builder /app/gateway/target/release/libgcc_s.so.1 /lib/
+COPY --from=builder /app/drift-ffi-sys/target/release/libdrift_ffi_sys.so /lib/
+COPY --from=builder /app/gateway/target/release/drift-gateway /bin/drift-gateway
 RUN apt-get update && apt-get install -y curl && rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
 ENTRYPOINT ["/bin/drift-gateway"]

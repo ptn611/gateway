@@ -54,7 +54,7 @@ docker run \
   -e DRIFT_GATEWAY_KEY=<BASE58_SEED> \
   -p 8080:8080 \
   --platform linux/x86_64 \
-  ghcr.io/velocity-exchange/gateway https://rpc-provider.example.com --host 0.0.0.0 \
+  ghcr.io/ptn611/gateway https://rpc-provider.example.com --host 0.0.0.0 \
   --markets wbtc,drift
   --extra-rpcs https://api.mainnet-beta.solana.com
 ```
