@@ -379,7 +379,7 @@ To query or stream orderbooks via WebSocket, public DLOB servers are available a
 - devnet: `wss://master.dlob.drift.trade/ws`
 - mainnet: `wss://dlob.drift.trade/ws`
 
-see https://github.com/velocity-exchange/dlob-server/blob/master/example/wsClient.ts for usage example
+see https://github.com/ptn611/dlob-server/blob/master/example/wsClient.ts for usage example
 
 ### Get Orders
 
